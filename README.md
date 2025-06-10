@@ -9,7 +9,7 @@ This is an official implementation of paper 'Frame Guidance: Training-Free Guida
 [Sangwon Jang*](https://agwmon.github.io/), [Taekyung Ki*](https://choi403.github.io/), [Jaehyeong Jo](http://harryjo97.github.io/), [Jaehong Yoon](https://jaehong31.github.io/), [Soo Ye Kim](https://sites.google.com/view/sooyekim), [Zhe Lin](https://sites.google.com/site/zhelin625/home), [Sungju Hwang](http://www.sungjuhwang.com/)
 <br/>(* indicates equal contribution)
 
-[![Project Website](https://img.shields.io/badge/Project-Website-orange)](https://frame-guidance-video.github.io/) [![arXiv](https://img.shields.io/badge/arXiv-2506.07177-b31b1b.svg)](https://arxiv.org/abs/0)
+[![Project Website](https://img.shields.io/badge/Project-Website-orange)](https://frame-guidance-video.github.io/) [![arXiv](https://img.shields.io/badge/arXiv-2506.07177-b31b1b.svg)](https://arxiv.org/abs/2506.07177)
 
 ## Installation
 Please refer to ```setting.sh``` for conda environment setup.
