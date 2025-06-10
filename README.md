@@ -20,7 +20,7 @@ Coming Soon ...
 ```
 @article{jang2025frameguidance,
         title={Frame Guidance: Training-Free Guidance for Frame-Level Control in Video Diffusion Models}, 
-        author={Sangwon Jang and Taekyung Kim and Jaehyeong Jo and Jaehong Yoon and Soo Ye Kim and Zhe Lin and Sung Ju Hwang},
+        author={Sangwon Jang and Taekyung Ki and Jaehyeong Jo and Jaehong Yoon and Soo Ye Kim and Zhe Lin and Sung Ju Hwang},
         journal={arXiv preprint arXiv:2506.07177},
         year={2025},
 }
