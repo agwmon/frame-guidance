@@ -373,6 +373,10 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
+        if video is None:
+            num_frames = 13 # default value for cogvx
+        else:
+            num_frames = (video.size(2) - 1) // self.vae_scale_factor_temporal + 1 if latents is None else latents.size(1)
 
         shape = (
             batch_size,
@@ -419,6 +423,15 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         frames = self.vae.decode(latents).sample
         return frames
+
+    def get_timesteps(self, num_inference_steps, timesteps, strength, device):
+        # get the original timestep using init_timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = timesteps[t_start * self.scheduler.order :]
+
+        return timesteps, num_inference_steps - t_start
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):
@@ -603,7 +616,6 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         additional_inputs: Optional[Dict[str, Any]] = None,
         travel_time: Tuple[int, int] = (0, 50),
         strength: float = 1.0,
-
     ) -> Union[CogVideoXPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -701,8 +713,12 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             video = add_frame_numbers(video[0])
             export_to_gif(video, save_path)
 
-        if loss_fn not in ["frame", "style", "scribble", "gray", "depth"]:
-            raise ValueError("loss_fn must be one of ['frame', 'style', 'scribble', 'gray', 'depth']")
+        height = height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
+        width = width or self.transformer.config.sample_width * self.vae_scale_factor_spatial
+        num_frames = num_frames or self.transformer.config.sample_frames
+        
+        if loss_fn not in ["frame", "style", "scribble", "gray", "depth", "loop"]:
+            raise ValueError("loss_fn must be one of ['frame', 'style', 'scribble', 'gray', 'depth', 'loop']")
         
         if loss_fn == "style":  
             assert additional_inputs is not None, "additional_inputs must be provided when loss_fn is 'style'"
@@ -750,13 +766,15 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 self.depth_preprocessor = DepthPreprocessor.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf").to(self._execution_device)
             with torch.no_grad():
                 video = [self.depth_preprocessor(frame, return_type="pt") for frame in video]
+        
+        elif loss_fn == "loop":
+            fixed_frames = [0, num_frames-1]
+            video = [Image.new("RGB", (width, height), color="white") for _ in range(num_frames)] # dummy video
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
-        height = height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
-        width = width or self.transformer.config.sample_width * self.vae_scale_factor_spatial
-        num_frames = num_frames or self.transformer.config.sample_frames
+
 
         num_videos_per_prompt = 1
 
@@ -812,6 +830,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         guidance_step = guidance_step[-num_inference_steps:]
         latent_timestep = timesteps[:1].repeat(batch_size * num_videos_per_prompt)
         self._num_timesteps = len(timesteps)
+
         # 5. Prepare latents
         latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
@@ -822,6 +841,11 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             additional_frames = patch_size_t - latent_frames % patch_size_t
             num_frames += additional_frames * self.vae_scale_factor_temporal
 
+        if latents is None and v2v_video is not None:
+            v2v_video = self.video_processor.preprocess_video(v2v_video, height=height, width=width)
+            v2v_video = v2v_video.to(device=device, dtype=prompt_embeds.dtype)
+
+        
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
             v2v_video,
@@ -939,104 +963,129 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     # (6) If in guidance range, compute MSE loss and gradient
                     if in_guidance_range and rep < n_repeats:
                         total_loss = 0.0
-                        if fixed_frames is None:
-                            fixed_frames_ = random.sample(range(5, 49), 4)
-                        else:
-                            fixed_frames_ = fixed_frames
 
-                        for fixed_frame in fixed_frames_:
-                            # Calculate corresponding latent frame index
-                            # Special handling for the first frame
-                            if fixed_frame < 5:
-                                print("fixed_frame < 5, pass")
-                                continue
-                            else:
-                                # For frames after 0, we need to consider:
-                                # - First latent frame (index 0) corresponds to real frame 0
-                                # - Second latent frame (index 1) corresponds to real frames 1,2,3,4
-                                # - Third latent frame (index 2) corresponds to real frames 5,6,7,8
-                                # So: latent_frame = (fixed_frame - 1) // 4 + 1
-                                latent_frame = (fixed_frame - 1) // 4 + 1
-                            
-                            # # Get the two latent frames needed for this fixed frame
-                            # # We need two consecutive frames because VAE decoding needs even number of frames
-                            # start_idx = max(0, latent_frame - (0 if fixed_frame == 0 else 1))
+                        if loss_fn == "loop":
+                            predicted_images = []
+                            for fixed_frame in fixed_frames:
+                                if fixed_frame == 0: # initial frame
+                                    latent_frame = 0
+                                    latent_pair = pred_original_sample[:, latent_frame:latent_frame+1]
 
-                            # Get the two latent frames needed for this fixed frame
-                            # For frame 0, use latent frames [0,1]
-                            # For other frames, use latent frames [N,N+1] where N is odd
-                            latent_pair = pred_original_sample[:, latent_frame-2:latent_frame+1]
-                            
-                            # Decode the latent pair to get real frames
-                            decoded_frames = self.decode_latents(latent_pair)  # Shape: [1, 3, 8, H, W]
-                            del latent_pair
-
-                            # Calculate which frame in the decoded sequence corresponds to our target frame
-                            # if fixed_frame == 0:
-                            #     relative_frame_idx = 0
-                            # else:
-                            #     # Calculate relative position within the 4-frame group
-                            #     relative_frame_idx = (fixed_frame - 1) % 4
-                            #     # If we started from previous latent frame, add 4 to the index
-                            #     if start_idx < latent_frame:
-                            #         relative_frame_idx += 4
+                                    # with torch.no_grad(): # stopgrad
+                                    decoded_frames = self.decode_latents(latent_pair)
                                     
-                            relative_frame_idx = (fixed_frame - 1) % 4 + 5
-                            pred_frame = decoded_frames[:, :, relative_frame_idx:relative_frame_idx+1] # 1, 3, 1, H, W
-                            
-                            # Add to total loss
-                            if loss_fn == "frame":
-                                loss = F.mse_loss(
-                                    pred_frame.float(),
-                                    original_video[:, :, fixed_frame:fixed_frame + 1].float(),
-                                    reduction="mean"
-                                )
-                            elif loss_fn == "style":
-                                pred_frame = pred_frame.squeeze(2)
-                                _, content_embedding, style_embedding = self.csd(clip_preprocess(pred_frame.float()))
-                                with torch.no_grad():
-                                    # style image is PIL image
-                                    if "style_embed" not in additional_inputs:
-                                        _, _, style_embedding_ref = self.csd(self.preprocess(style_image).unsqueeze(0).to(device))
-                                        additional_inputs["style_embed"] = style_embedding_ref
-                                    else:
-                                        style_embedding_ref = additional_inputs["style_embed"]
+                                    relative_frame_idx = 0
+                                    pred_frame = decoded_frames[:, :, relative_frame_idx:relative_frame_idx+1]
+                                    predicted_images.append(pred_frame)
+                                    
+                                else: # last frame
+                                    latent_frame = (fixed_frame - 1) // 4 + 1
+                                    latent_pair = pred_original_sample[:, latent_frame-2:latent_frame+1]
 
-               
-                                    style_embedding_ref = style_embedding_ref.to(device)
-                                style_similarity = cosine_loss(style_embedding, style_embedding_ref)
-                                print(f"style_similarity({i}/{rep}): {style_similarity.item():.3f}")
-                                loss = style_weight * (1 - style_similarity)
+                                    decoded_frames = self.decode_latents(latent_pair)
+                                    relative_frame_idx = (fixed_frame - 1) % 4 + 5
+                                    pred_frame = decoded_frames[:, :, relative_frame_idx:relative_frame_idx+1]
+                                    predicted_images.append(pred_frame)
+
+                            total_loss = F.mse_loss(
+                                predicted_images[0].detach(),
+                                predicted_images[1],
+                                reduction="mean"
+                            )
+                            # print(f"loop_loss({i}/{rep}): {total_loss.item():.3f}")
+
+                            del predicted_images, decoded_frames
+                            torch.cuda.empty_cache()
+
+                        else: # style, scribble, gray, depth ...
+                            if fixed_frames is None:
+                                fixed_frames_ = random.sample(range(5, 49), 4)
+                            else:
+                                fixed_frames_ = fixed_frames
+
+                            for fixed_frame in fixed_frames_:
+                                # Calculate corresponding latent frame index
+                                # Special handling for the first frame
+                                if fixed_frame < 5:
+                                    print("fixed_frame < 5, pass")
+                                    continue
+                                else:
+                                    # For frames after 0, we need to consider:
+                                    # - First latent frame (index 0) corresponds to real frame 0
+                                    # - Second latent frame (index 1) corresponds to real frames 1,2,3,4
+                                    # - Third latent frame (index 2) corresponds to real frames 5,6,7,8
+                                    # So: latent_frame = (fixed_frame - 1) // 4 + 1
+                                    latent_frame = (fixed_frame - 1) // 4 + 1
                                 
-                                if "content_weight" in additional_inputs:
-                                    content_similarity = cosine_loss(content_embedding, content_embeddings[fixed_frame])
-                                    print(f"content_similarity({i}/{rep}): {content_similarity.item():.3f}")
-                                    loss += content_weight * (1 - content_similarity)
+                                # # Get the two latent frames needed for this fixed frame
+                                # # We need two consecutive frames because VAE decoding needs even number of frames
+                                # start_idx = max(0, latent_frame - (0 if fixed_frame == 0 else 1))
 
-                            elif loss_fn == "scribble" or loss_fn == "gray":
-                                sketch_observation = self.aug(pred_frame.squeeze(2).float(), mode=loss_fn)
-                                target = video[fixed_frame].float()
-                                loss = F.mse_loss(
-                                    sketch_observation,
-                                    target,
-                                    reduction="mean"
-                                )
-                            
-                            # elif loss_fn == "face":
-                            #     print("pred_frame", pred_frame.shape)
-                            #     face_similarity = idloss.get_cosine_similarity(pred_frame.squeeze())
-                            #     loss = 1 - face_similarity
+                                # Get the two latent frames needed for this fixed frame
+                                # For frame 0, use latent frames [0,1]
+                                # For other frames, use latent frames [N,N+1] where N is odd
+                                latent_pair = pred_original_sample[:, latent_frame-2:latent_frame+1]
+                                
+                                # Decode the latent pair to get real frames
+                                decoded_frames = self.decode_latents(latent_pair)  # Shape: [1, 3, 8, H, W]
+                                del latent_pair
+                                        
+                                relative_frame_idx = (fixed_frame - 1) % 4 + 5
+                                pred_frame = decoded_frames[:, :, relative_frame_idx:relative_frame_idx+1] # 1, 3, 1, H, W
+                                
+                                # Add to total loss
+                                if loss_fn == "frame":
+                                    loss = F.mse_loss(
+                                        pred_frame.float(),
+                                        original_video[:, :, fixed_frame:fixed_frame + 1].float(),
+                                        reduction="mean"
+                                    )
+                                elif loss_fn == "style":
+                                    pred_frame = pred_frame.squeeze(2)
+                                    _, content_embedding, style_embedding = self.csd(clip_preprocess(pred_frame.float()))
+                                    with torch.no_grad():
+                                        # style image is PIL image
+                                        if "style_embed" not in additional_inputs:
+                                            _, _, style_embedding_ref = self.csd(self.preprocess(style_image).unsqueeze(0).to(device))
+                                            additional_inputs["style_embed"] = style_embedding_ref
+                                        else:
+                                            style_embedding_ref = additional_inputs["style_embed"]
 
-                            elif loss_fn == "depth":
-                                pred_depth = self.depth_preprocessor(pred_frame.squeeze(2), return_type="pt")
-                                loss = F.mse_loss(
-                                    pred_depth.float(),
-                                    video[fixed_frame].float(),
-                                    reduction="mean"
-                                )
-                            total_loss += loss
-                            # Clear intermediate tensors
-                            del decoded_frames, pred_frame
+                
+                                        style_embedding_ref = style_embedding_ref.to(device)
+                                    style_similarity = cosine_loss(style_embedding, style_embedding_ref)
+                                    print(f"style_similarity({i}/{rep}): {style_similarity.item():.3f}")
+                                    loss = style_weight * (1 - style_similarity)
+                                    
+                                    if "content_weight" in additional_inputs:
+                                        content_similarity = cosine_loss(content_embedding, content_embeddings[fixed_frame])
+                                        print(f"content_similarity({i}/{rep}): {content_similarity.item():.3f}")
+                                        loss += content_weight * (1 - content_similarity)
+
+                                elif loss_fn == "scribble" or loss_fn == "gray":
+                                    sketch_observation = self.aug(pred_frame.squeeze(2).float(), mode=loss_fn)
+                                    target = video[fixed_frame].float()
+                                    loss = F.mse_loss(
+                                        sketch_observation,
+                                        target,
+                                        reduction="mean"
+                                    )
+                                
+                                # elif loss_fn == "face":
+                                #     print("pred_frame", pred_frame.shape)
+                                #     face_similarity = idloss.get_cosine_similarity(pred_frame.squeeze())
+                                #     loss = 1 - face_similarity
+
+                                elif loss_fn == "depth":
+                                    pred_depth = self.depth_preprocessor(pred_frame.squeeze(2), return_type="pt")
+                                    loss = F.mse_loss(
+                                        pred_depth.float(),
+                                        video[fixed_frame].float(),
+                                        reduction="mean"
+                                    )
+                                total_loss += loss
+                                # Clear intermediate tensors
+                                del decoded_frames, pred_frame
 
                         # Instead of torch.autograd.grad(), use backward()
                         total_loss.backward()

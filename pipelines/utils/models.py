@@ -131,7 +131,7 @@ def setup_csd(device: str = "cpu") -> tuple[nn.Module, Callable]:
         The initialized CSD model and preprocess function.
     """
     model = CSD_CLIP("vit_large", "default")
-    model_path = "CSD_PATH/CSD-ViT-L/pytorch_model.bin"
+    model_path = "model/CSD-ViT-L/pytorch_model.bin"
     if has_batchnorms(model):
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 

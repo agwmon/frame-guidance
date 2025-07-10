@@ -6,3 +6,6 @@ pip install git+https://github.com/openai/CLIP.git opencv-python
 
 cd pipelines/utils/image_gen_aux
 pip install -e .
+
+# download CSD model for stylized video generation
+# Download https://huggingface.co/tomg-group-umd/CSD-ViT-L and put it under `.model/CSD-ViT-L`.
