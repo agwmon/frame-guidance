@@ -1,0 +1,2 @@
+[console_scripts]
+image_gen_aux-cli = image_gen_aux.commands.image_gen_aux:main
