@@ -642,6 +642,216 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
     def interrupt(self):
         return self._interrupt
 
+    # ------------------------------------------------------------------ #
+    #  Helper: validate guidance args & normalize to per-step lists
+    # ------------------------------------------------------------------ #
+    def _validate_guidance_args(self, guidance_step, guidance_lr, num_inference_steps, loss_fn):
+        VALID_LOSS_FNS = {"frame", "style", "scribble", "gray", "depth", "lineart"}
+        if loss_fn not in VALID_LOSS_FNS:
+            raise ValueError(f"loss_fn must be one of {sorted(VALID_LOSS_FNS)}")
+
+        if isinstance(guidance_step, int):
+            guidance_step = [guidance_step] * num_inference_steps
+        else:
+            assert len(guidance_step) == num_inference_steps, \
+                "guidance_step must be a list of length num_inference_steps"
+
+        if isinstance(guidance_lr, float):
+            guidance_lr = [guidance_lr] * num_inference_steps
+        else:
+            assert len(guidance_lr) == num_inference_steps, \
+                "guidance_lr must be a list of length num_inference_steps"
+
+        return guidance_step, guidance_lr
+
+    # ------------------------------------------------------------------ #
+    #  Helper: prepare per-loss-fn context (models, embeddings, etc.)
+    # ------------------------------------------------------------------ #
+    def _prepare_loss_context(self, loss_fn, video, additional_inputs, device, dtype, latent_downscale_factor=1):
+        """Return a dict of pre-computed objects needed by the chosen loss."""
+        ctx: Dict[str, Any] = {}
+
+        if loss_fn == "style":
+            assert additional_inputs is not None and "style_image" in additional_inputs, \
+                "additional_inputs with 'style_image' required for style loss"
+            if not hasattr(self, "csd"):
+                self.csd, self.preprocess = setup_csd(device=device)
+            ctx["cosine_loss"] = torch.nn.CosineSimilarity(dim=1)
+            ctx["style_image"] = additional_inputs["style_image"]
+            ctx["content_image"] = additional_inputs.get("content_image", None)
+            ctx["style_weight"] = additional_inputs.get("style_weight", 1.0)
+            ctx["content_weight"] = additional_inputs.get("content_weight", 0.0)
+
+        elif loss_fn in ("scribble", "gray"):
+            assert video is not None, "video must be provided for scribble/gray loss"
+            if not hasattr(self, "aug"):
+                self.aug = DifferentiableAugmenter().to(device).requires_grad_(False)
+            to_tensor = T.ToTensor()
+            cond_video = [to_tensor(f).to(device, dtype=dtype) for f in video]
+            with torch.no_grad():
+                cond_video = [self.aug(f, mode=loss_fn) for f in cond_video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f.unsqueeze(0), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).squeeze(0) for f in cond_video]
+                ctx["cond_video"] = cond_video
+
+        elif loss_fn == "depth":
+            assert video is not None, "video must be provided for depth loss"
+            if not hasattr(self, "depth_preprocessor"):
+                self.depth_preprocessor = DepthPreprocessor.from_pretrained(
+                    "depth-anything/Depth-Anything-V2-Large-hf"
+                ).to(device)
+            with torch.no_grad():
+                cond_video = [self.depth_preprocessor(f, return_type="pt") for f in video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f, scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False) for f in cond_video]
+                ctx["cond_video"] = cond_video
+
+        elif loss_fn == "lineart":
+            assert video is not None, "video must be provided for lineart loss"
+            if not hasattr(self, "lineart_preprocessor"):
+                self.lineart_preprocessor = LineArtPreprocessor.from_pretrained("OzzyGT/lineart").to(device)
+            with torch.no_grad():
+                cond_video = [self.lineart_preprocessor(f, invert=False, return_type="pt") for f in video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f, scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False) for f in cond_video]
+                ctx["cond_video"] = cond_video
+
+        elif loss_fn == "frame":
+            if additional_inputs is not None and "mask_video" in additional_inputs:
+                mask_video = []
+                for frame in additional_inputs["mask_video"]:
+                    frame = torch.from_numpy(np.array(frame)).permute(2, 0, 1)  # 3, H, W
+                    frame = frame.unsqueeze(0).unsqueeze(2)                     # 1, 3, 1, H, W
+                    if latent_downscale_factor > 1:
+                        b, c, f, h, w = frame.shape
+                        frame = F.interpolate(frame.squeeze(2), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).unsqueeze(2)
+                    mask_video.append(frame.to(device, dtype=dtype))
+                ctx["mask_video"] = mask_video
+
+        return ctx
+
+    # ------------------------------------------------------------------ #
+    #  Helper: single transformer forward pass (with or without grad)
+    # ------------------------------------------------------------------ #
+    def _predict_noise(
+        self, latent_model_input, prompt_embeds, timestep,
+        ofs_emb, image_rotary_emb, attention_kwargs, *, enable_grad=False,
+    ):
+        ctx_mgr = torch.enable_grad() if enable_grad else torch.no_grad()
+        with ctx_mgr:
+            noise_pred = self.transformer(
+                hidden_states=latent_model_input,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                ofs=ofs_emb,
+                image_rotary_emb=image_rotary_emb,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+        return noise_pred.float()
+
+    # ------------------------------------------------------------------ #
+    #  Helper: compute guidance loss for one fixed frame
+    # ------------------------------------------------------------------ #
+    def _compute_single_frame_loss(
+        self, loss_fn, pred_original_sample, fixed_frame,
+        original_video, loss_ctx, additional_inputs, device, step_idx, rep_idx,
+        latent_downscale_factor=1,
+    ):
+        """Decode the predicted latent around *fixed_frame* and return a scalar loss."""
+        if fixed_frame < 5:
+            print("fixed_frame < 5, pass")
+            return None
+
+        latent_frame = (fixed_frame - 1) // 4 + 1
+        latent_pair = pred_original_sample[:, latent_frame - 2 : latent_frame + 1]
+        if latent_downscale_factor > 1:
+            b, f, c, h, w = latent_pair.shape
+            latent_pair = latent_pair.reshape(b * f, c, h, w)
+            latent_pair = F.interpolate(latent_pair, scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False)
+            latent_pair = latent_pair.reshape(b, f, c, latent_pair.shape[-2], latent_pair.shape[-1])
+        decoded_frames = self.decode_latents(latent_pair)
+        del latent_pair
+
+        relative_idx = (fixed_frame - 1) % 4 + 5
+        pred_frame = decoded_frames[:, :, relative_idx : relative_idx + 1]  # 1, 3, 1, H, W
+
+        # ---- per-loss-fn computation ----
+        if loss_fn == "frame":
+            target = original_video[:, :, fixed_frame : fixed_frame + 1].float()
+            if latent_downscale_factor > 1:
+                b, c, f, h, w = target.shape
+                target = F.interpolate(target.squeeze(2), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).unsqueeze(2)
+            if "mask_video" in loss_ctx:
+                loss = (F.mse_loss(pred_frame.float(), target, reduction="none")
+                        * loss_ctx["mask_video"][fixed_frame]).mean()
+            else:
+                loss = F.mse_loss(pred_frame.float(), target)
+
+        elif loss_fn == "style":
+            pred_frame_sq = pred_frame.squeeze(2)
+            _, content_emb, style_emb = self.csd(clip_preprocess(pred_frame_sq.float()))
+            with torch.no_grad():
+                if "style_embed" not in additional_inputs:
+                    _, _, style_emb_ref = self.csd(
+                        self.preprocess(loss_ctx["style_image"]).unsqueeze(0).to(device))
+                    additional_inputs["style_embed"] = style_emb_ref
+                    if loss_ctx["content_image"] is not None:
+                        _, content_emb_ref, _ = self.csd(
+                            self.preprocess(loss_ctx["content_image"]).unsqueeze(0).to(device))
+                        additional_inputs["content_embed"] = content_emb_ref
+                style_emb_ref = additional_inputs["style_embed"].to(device)
+            cos = loss_ctx["cosine_loss"]
+            style_sim = cos(style_emb, style_emb_ref)
+            print(f"style_similarity({step_idx}/{rep_idx}): {style_sim.item():.3f}")
+            loss = loss_ctx["style_weight"] * (1 - style_sim)
+            if "content_embed" in additional_inputs:
+                content_emb_ref = additional_inputs["content_embed"].to(device)
+                content_sim = cos(content_emb, content_emb_ref)
+                print(f"content_similarity({step_idx}/{rep_idx}): {content_sim.item():.3f}")
+                loss = loss + loss_ctx["content_weight"] * (1 - content_sim)
+
+        elif loss_fn in ("scribble", "gray"):
+            sketch_obs = self.aug(pred_frame.squeeze(2).float(), mode=loss_fn)
+            loss = F.mse_loss(sketch_obs, loss_ctx["cond_video"][fixed_frame].float())
+
+        elif loss_fn == "depth":
+            pred_depth = self.depth_preprocessor(pred_frame.squeeze(2), return_type="pt")
+            loss = F.mse_loss(pred_depth.float(), loss_ctx["cond_video"][fixed_frame].float())
+
+        elif loss_fn == "lineart":
+            pred_la = self.lineart_preprocessor(pred_frame.squeeze(2), invert=False, return_type="pt")
+            gt = loss_ctx["cond_video"][fixed_frame].float()
+            weight = (gt > 0.5).float() * 1.0 + (gt <= 0.5).float() * 0.1
+            loss = weighted_mse_loss(pred_la, gt, weight)
+
+        del decoded_frames, pred_frame
+        return loss
+
+    # ------------------------------------------------------------------ #
+    #  Helper: apply gradient-based guidance update to latents
+    # ------------------------------------------------------------------ #
+    def _apply_guidance_update(
+        self, latents, pred_original_sample, grad,
+        guidance_lr_i, a_t, b_t, alpha_prod_t, alpha_prod_t_prev,
+        generator, device, in_travel_time,
+    ):
+        grad_norm = grad.norm(2)
+        rho = 1.0 / grad_norm
+
+        with torch.no_grad():
+            if in_travel_time:
+                x_prev = a_t * latents + b_t * pred_original_sample
+                x_prev = x_prev - guidance_lr_i * rho * grad
+                noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+                coef_x_prev = (alpha_prod_t / alpha_prod_t_prev) ** 0.5
+                coef_noise = (1 - alpha_prod_t / alpha_prod_t_prev) ** 0.5
+                latents = x_prev * coef_x_prev + noise * coef_noise
+            else:
+                latents = latents - guidance_lr_i * rho * grad
+
+        return latents
+
     # @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -677,6 +887,7 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         loss_fn: str = "frame",
         additional_inputs: Optional[Dict[str, Any]] = None,
         travel_time: Tuple[int, int] = (0, 50),
+        latent_downscale_factor: int = 1,
     ) -> Union[CogVideoXPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -759,77 +970,19 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
             [`~pipelines.cogvideo.pipeline_output.CogVideoXPipelineOutput`] if `return_dict` is True, otherwise a
             `tuple`. When returning a tuple, the first element is a list with the generated images.
         """
-        if isinstance(guidance_step, int):
-            guidance_step = [guidance_step] * num_inference_steps
-        else:
-            assert len(guidance_step) == num_inference_steps, "guidance_step must be a list of length num_inference_steps"
+        # --- Validate & normalize guidance arguments ---
+        guidance_step, guidance_lr = self._validate_guidance_args(
+            guidance_step, guidance_lr, num_inference_steps, loss_fn)
 
-        if isinstance(guidance_lr, float):
-            guidance_lr = [guidance_lr] * num_inference_steps
-        else:
-            assert len(guidance_lr) == num_inference_steps, "guidance_lr must be a list of length num_inference_steps"
-        
-        if loss_fn not in ["frame", "style", "scribble", "gray","depth", "lineart"]:
-            raise ValueError("loss_fn must be one of ['frame', 'style', 'scribble', 'gray', 'depth', 'lineart']")
-        
-        if loss_fn == "style":  
-            assert additional_inputs is not None, "additional_inputs must be provided when loss_fn is 'style'"
-            if "style_image" not in additional_inputs:
-                raise ValueError("style_image must be provided in additional_inputs when loss_fn is 'style'")
-            style_image = additional_inputs["style_image"]
-            content_image = additional_inputs.get("content_image", None)
-            
-            cosine_loss = torch.nn.CosineSimilarity(dim=1)
-            # if csd is not already initialized, initialize it
-            if not hasattr(self, "csd"):
-                self.csd, self.preprocess = setup_csd(device=self._execution_device)
-            
-            style_weight = additional_inputs.get("style_weight", 1.0)
-            content_weight = additional_inputs.get("content_weight", 0.0)
-        
-        elif loss_fn == "scribble" or loss_fn == "gray":
-            assert video is not None, "video must be provided when loss_fn is 'scribble'"
-            if not hasattr(self, "sketch_model"):
-                self.aug = DifferentiableAugmenter().to(self._execution_device).requires_grad_(False)
-            import torchvision.transforms as T
-            to_tensor = T.ToTensor()
-            cond_video = [to_tensor(frame).to(self._execution_device, dtype=self.transformer.dtype) for frame in video]
-            with torch.no_grad():
-                cond_video = [self.aug(frame, mode=loss_fn) for frame in cond_video]      
+        if latent_downscale_factor not in (1, 2, 4):
+            raise ValueError("latent_downscale_factor must be one of [1, 2, 4]")
 
-        # elif loss_fn == "face":
-        #     assert additional_inputs is not None, "additional_inputs must be provided when loss_fn is 'face'"
-        #     if "ref_image" not in additional_inputs:
-        #         raise ValueError("ref_image must be provided in additional_inputs when loss_fn is 'face'")
-        #     ref_image = additional_inputs["ref_image"]
-        #     idloss = IDLoss(ref_image).to(self._execution_device)
-        
-        elif loss_fn == "depth":
-            assert video is not None, "video must be provided when loss_fn is 'depth'"
-            if not hasattr(self, "depth_preprocessor"):
-                # self.depth_preprocessor = DepthPreprocessor.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf").to(self._execution_device)
-                self.depth_preprocessor = DepthPreprocessor.from_pretrained("depth-anything/Depth-Anything-V2-Large-hf").to(self._execution_device)
-            with torch.no_grad():
-                cond_video = [self.depth_preprocessor(frame, return_type="pt") for frame in video]
+        # --- Prepare loss-specific context (models, conditioning videos, etc.) ---
+        loss_ctx = self._prepare_loss_context(
+            loss_fn, video, additional_inputs,
+            device=self._execution_device, dtype=self.transformer.dtype,
+            latent_downscale_factor=latent_downscale_factor)
 
-        elif loss_fn == "lineart":
-            assert video is not None, "video must be provided when loss_fn is 'lineart'"
-            if not hasattr(self, "lineart_preprocessor"):
-                self.lineart_preprocessor = LineArtPreprocessor.from_pretrained("OzzyGT/lineart").to(self._execution_device)
-            with torch.no_grad():
-                cond_video = [self.lineart_preprocessor(frame, invert=False, return_type="pt") for frame in video]
-
-        if loss_fn == "frame":
-            if additional_inputs is not None:
-                if "mask_video" in additional_inputs:
-                    mask_video_ = additional_inputs["mask_video"]
-                    # mask_video = [torch.from_numpy(np.array(frame.convert("L"))) for frame in mask_video] # 0, 1. tensor // list of [480, 720, 1]               
-                    mask_video = []
-                    for frame in mask_video_:
-                        frame = torch.from_numpy(np.array(frame)).permute(2, 0, 1) # 3, 480, 720
-                        frame = frame.unsqueeze(0).unsqueeze(2) # 1, 3, 1, 480, 720
-                        mask_video.append(frame.to(self._execution_device, dtype=self.transformer.dtype))
-                        
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
@@ -951,80 +1104,43 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            # for DPM-solver++
             old_pred_original_sample = None
-            max_grad_norm = 1.0
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
-                # Determine if we are in the guidance range
                 in_guidance_range = (guidance_step[i] != 0) and (fixed_frames is not None)
-                # If in guidance range, perform 'repeat' updates; otherwise, do a single step
-                # n_repeats = repeat if in_guidance_range else 0
                 n_repeats = guidance_step[i]
 
-                # Compute alpha and beta for the current timestep
+                # Diffusion coefficients for this timestep
                 prev_timestep = t - (self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps)
                 alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                alpha_prod_t_prev = (
-                    self.scheduler.alphas_cumprod[prev_timestep]
-                    if prev_timestep >= 0
-                    else self.scheduler.final_alpha_cumprod
-                )
+                alpha_prod_t_prev = (self.scheduler.alphas_cumprod[prev_timestep]
+                                     if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod)
                 beta_prod_t = 1 - alpha_prod_t
-
-                # Compute diffusion step coefficients
                 a_t = ((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) ** 0.5
-                b_t = alpha_prod_t_prev**0.5 - alpha_prod_t**0.5 * a_t
+                b_t = alpha_prod_t_prev ** 0.5 - alpha_prod_t ** 0.5 * a_t
 
-                # -----------------------------------------
-                # 1) If in guidance range, perform 'repeat' guidance updates
-                #    (denoising step is applied once afterward)
-                # -----------------------------------------
-                for rep in range(n_repeats+1):
-                    # Set requires_grad only when within the guidance range
+                # ---- guidance repeats + final denoising forward ----
+                for rep in range(n_repeats + 1):
                     latents = latents.detach().requires_grad_(in_guidance_range)
 
-                    # (1) Prepare model input
+                    # Build model input
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
                     latent_image_input = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
                     latent_model_input = torch.cat([latent_model_input, latent_image_input], dim=2)
-
-                    # Expand timestep to match batch dimension
                     timestep = t.expand(latent_model_input.shape[0])
 
-                    # (2) Predict noise
-                    if in_guidance_range and rep < n_repeats:
-                        # Enable gradients for guidance updates
-                        with torch.enable_grad():
-                            noise_pred = self.transformer(
-                                hidden_states=latent_model_input,
-                                encoder_hidden_states=prompt_embeds,
-                                timestep=timestep,
-                                ofs=ofs_emb,
-                                image_rotary_emb=image_rotary_emb,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
-                    else:
-                        # No gradient updates outside guidance range
-                        with torch.no_grad():
-                            noise_pred = self.transformer(
-                                hidden_states=latent_model_input,
-                                encoder_hidden_states=prompt_embeds,
-                                timestep=timestep,
-                                ofs=ofs_emb,
-                                image_rotary_emb=image_rotary_emb,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
+                    # Predict noise
+                    need_grad = in_guidance_range and rep < n_repeats
+                    noise_pred = self._predict_noise(
+                        latent_model_input, prompt_embeds, timestep,
+                        ofs_emb, image_rotary_emb, attention_kwargs,
+                        enable_grad=need_grad,
+                    )
 
-                    noise_pred = noise_pred.float()
-
-                    # (3) Apply dynamic CFG scaling (optional)
+                    # Dynamic / static CFG
                     if use_dynamic_cfg:
                         self._guidance_scale = 1 + guidance_scale * (
                             (1 - math.cos(math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
@@ -1032,186 +1148,54 @@ class CogVideoXImageToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
                     else:
                         self._guidance_scale = guidance_scale
 
-                    # (4) Apply classifier-free guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + self._guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                    with torch.no_grad():
-                        correction = noise_pred_text - noise_pred_uncond
-                        correction = correction.detach()
+                    # Predicted x0
+                    pred_original_sample = (
+                        (alpha_prod_t ** 0.5) * latents - (beta_prod_t ** 0.5) * noise_pred
+                    ).to(prompt_embeds.dtype)[:, additional_frames:]
 
-                    # (5) Compute predicted original sample
-                    #     Used for denoising but also for guidance gradient computation
-                    pred_original_sample = (alpha_prod_t**0.5) * latents - (beta_prod_t**0.5) * noise_pred
-                    pred_original_sample = pred_original_sample.to(prompt_embeds.dtype)[:, additional_frames:]
-
-                    # (6) If in guidance range, compute MSE loss and gradient
-                    if in_guidance_range and rep < n_repeats:
+                    # ---- Guidance gradient step (skip on last rep) ----
+                    if need_grad:
                         total_loss = 0.0
-                        for fixed_frame in fixed_frames:
-                            # Calculate corresponding latent frame index
-                            # Special handling for the first frame
-                            if fixed_frame < 5:
-                                print("fixed_frame < 5, pass")
-                                continue
-                            else:
-                                # For frames after 0, we need to consider:
-                                # - First latent frame (index 0) corresponds to real frame 0
-                                # - Second latent frame (index 1) corresponds to real frames 1,2,3,4
-                                # - Third latent frame (index 2) corresponds to real frames 5,6,7,8
-                                # So: latent_frame = (fixed_frame - 1) // 4 + 1
-                                latent_frame = (fixed_frame - 1) // 4 + 1
-                            
-                            # # Get the two latent frames needed for this fixed frame
-                            # # We need two consecutive frames because VAE decoding needs even number of frames
-                            # start_idx = max(0, latent_frame - (0 if fixed_frame == 0 else 1))
-
-                            # Get the two latent frames needed for this fixed frame
-                            # For frame 0, use latent frames [0,1]
-                            # For other frames, use latent frames [N,N+1] where N is odd
-                            latent_pair = pred_original_sample[:, latent_frame-2:latent_frame+1]
-                            
-                            # Decode the latent pair to get real frames
-                            decoded_frames = self.decode_latents(latent_pair)  # Shape: [1, 3, 8, H, W]
-                            del latent_pair
-
-                            relative_frame_idx = (fixed_frame - 1) % 4 + 5
-                            pred_frame = decoded_frames[:, :, relative_frame_idx:relative_frame_idx+1] # 1, 3, 1, H, W
-                            
-                            # Add to total loss
-                            if loss_fn == "frame":
-                                if additional_inputs is not None:
-                                    if "mask_video" in additional_inputs:
-                                        loss = F.mse_loss(
-                                            pred_frame.float(),
-                                            original_video[:, :, fixed_frame:fixed_frame + 1].float(),
-                                            reduction="none"
-                                        )
-                                        loss = (loss * mask_video[fixed_frame]).mean()
-                                else:
-                                    loss = F.mse_loss(
-                                        pred_frame.float(),
-                                        original_video[:, :, fixed_frame:fixed_frame + 1].float(),
-                                        reduction="mean"
-                                    )
-                                
-                            elif loss_fn == "style":
-                                pred_frame = pred_frame.squeeze(2)
-                                _, content_embedding, style_embedding = self.csd(clip_preprocess(pred_frame.float()))
-                                with torch.no_grad():
-                                    # style image is PIL image
-                                    if "style_embed" not in additional_inputs:
-                                        _, _, style_embedding_ref = self.csd(self.preprocess(style_image).unsqueeze(0).to(device))
-                                        additional_inputs["style_embed"] = style_embedding_ref
-                                        if "content_image" in additional_inputs:
-                                            _, content_embedding_ref, _ = self.csd(self.preprocess(content_image).unsqueeze(0).to(device))
-                                            additional_inputs["content_embed"] = content_embedding_ref
-                                            content_embedding_ref = content_embedding_ref.to(device)
-                                    else:
-                                        style_embedding_ref = additional_inputs["style_embed"]
-                                        if "content_embed" in additional_inputs:
-                                            content_embedding_ref = additional_inputs["content_embed"]
-                                            content_embedding_ref = content_embedding_ref.to(device)
-                                    style_embedding_ref = style_embedding_ref.to(device)
-                                style_similarity = cosine_loss(style_embedding, style_embedding_ref)
-                                print(f"style_similarity({i}/{rep}): {style_similarity.item():.3f}")
-                                loss = style_weight * (1 - style_similarity)
-                                
-                                if "content_embed" in additional_inputs:
-                                    content_similarity = cosine_loss(content_embedding, content_embedding_ref)
-                                    print(f"content_similarity({i}/{rep}): {content_similarity.item():.3f}")
-                                    loss += content_weight * (1 - content_similarity)
-
-                            elif loss_fn == "scribble" or loss_fn == "gray":
-                                sketch_observation = self.aug(pred_frame.squeeze(2).float(), mode=loss_fn)
-                                target = cond_video[fixed_frame].float()
-                                loss = F.mse_loss(
-                                    sketch_observation,
-                                    target,
-                                    reduction="mean"
-                                )
-                            
-                            # elif loss_fn == "face":
-                            #     print("pred_frame", pred_frame.shape)
-                            #     face_similarity = idloss.get_cosine_similarity(pred_frame.squeeze())
-                            #     loss = 1 - face_similarity
-
-                            elif loss_fn == "depth":
-                                pred_depth = self.depth_preprocessor(pred_frame.squeeze(2), return_type="pt")
-                                loss = F.mse_loss(
-                                    pred_depth.float(),
-                                    cond_video[fixed_frame].float(),
-                                    reduction="mean"
-                                )
-                            
-                            elif loss_fn == "lineart":
-                                pred_lineart = self.lineart_preprocessor(pred_frame.squeeze(2), invert=False, return_type="pt")
-                                gt_sketch = cond_video[fixed_frame].float()
-                                base_weight = (gt_sketch > 0.5).float() * 1.0 + (gt_sketch <= 0.5).float() * 0.1
-                                loss = weighted_mse_loss(pred_lineart, gt_sketch, base_weight)
-
-                            total_loss += loss
-                            
-                            # Clear intermediate tensors
-                            del decoded_frames, pred_frame
+                        for ff in fixed_frames:
+                            loss = self._compute_single_frame_loss(
+                                loss_fn, pred_original_sample, ff,
+                                original_video, loss_ctx, additional_inputs,
+                                device, step_idx=i, rep_idx=rep,
+                                latent_downscale_factor=latent_downscale_factor,
+                            )
+                            if loss is not None:
+                                total_loss = total_loss + loss
 
                         total_loss.backward()
                         print("total_loss", total_loss.item())
                         grad = latents.grad.clone()
-                        latents.grad = None  # Clear the gradients
+                        latents.grad = None
 
-                        # Apply gradient clipping
-                        grad_norm = grad.norm(2)
-                        rho = 1 / grad_norm
-
-                        if i >= travel_time[0] and i <= travel_time[1]:
-                            # print("Time travel!")
-                            with torch.no_grad():
-                                x_prev = a_t * latents + b_t * pred_original_sample
-                                x_prev = x_prev - guidance_lr[i] * rho * grad
-                                noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
-                                coef_x_prev = (alpha_prod_t / alpha_prod_t_prev) ** 0.5
-                                coef_noise = (1 - alpha_prod_t / alpha_prod_t_prev) ** 0.5
-                                latents = x_prev * coef_x_prev + noise * coef_noise
-                        else:
-                            # print("DLO!")
-                            with torch.no_grad():
-                                latents = latents - guidance_lr[i] * rho * grad
-
+                        in_travel = travel_time[0] <= i <= travel_time[1]
+                        latents = self._apply_guidance_update(
+                            latents, pred_original_sample, grad,
+                            guidance_lr[i], a_t, b_t, alpha_prod_t, alpha_prod_t_prev,
+                            generator, device, in_travel,
+                        )
                         torch.cuda.empty_cache()
-                    else:
-                        # If outside guidance range, skip repeated updates
-                        # and proceed directly to the final denoising step
-                        pass
-                
-                # -----------------------------------------
-                # 2) After all guidance updates, apply a single denoising step
-                #    latents = a_t * latents + b_t * pred_original_sample
-                # -----------------------------------------
-                #
-                #   - Uses noise_pred and pred_original_sample from the last repeat iteration
-                #   - This step is applied once per timestep, even outside guidance range
+
+                # ---- Final denoising step (once per timestep) ----
                 with torch.no_grad():
                     latents = a_t * latents + b_t * pred_original_sample
-                
-                if hasattr(self, "save_dir"):
-                    with torch.no_grad():
-                        z0_latents = pred_original_sample[:, additional_frames:].to(prompt_embeds.dtype)
-                        save_vis(z0_latents, f"{self.save_dir}/latents_{i}_fin.gif")
 
                 latents = latents.to(prompt_embeds.dtype)
 
-                # call the callback, if provided
+                # Step-end callback
                 if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    cb_kwargs = {k: locals()[k] for k in callback_on_step_end_tensor_inputs}
+                    cb_out = callback_on_step_end(self, i, t, cb_kwargs)
+                    latents = cb_out.pop("latents", latents)
+                    prompt_embeds = cb_out.pop("prompt_embeds", prompt_embeds)
+                    negative_prompt_embeds = cb_out.pop("negative_prompt_embeds", negative_prompt_embeds)
 
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
