@@ -1,4 +1,4 @@
-# Frame Guidance: Training-Free Guidance for Frame-Level Control in Video Diffusion Model
+# Frame Guidance: Training-Free Guidance for Frame-Level Control in Video Diffusion Models
 > ### TL;DR:
 > We present Frame Guidance, a **training-free** framework that supports **diverse control tasks** using **frame-level** signals.
 
@@ -13,6 +13,8 @@ This is an official implementation of paper 'Frame Guidance: Training-Free Guida
 
 ## Installation
 > 2026.02.11: 🚨 There is an installation error with openai-CLIP. Please refer to: https://github.com/openai/CLIP/issues/528.
+
+> 2026.02.12: 🚨 There is a Wan model loading error with `transformers==5.0.0`. Please use `transformers==4.57.3` until this issue is fixed.
 
 
 Please refer to `setting.sh` for conda environment setup.

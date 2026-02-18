@@ -43,6 +43,23 @@ from .utils.models import setup_csd, DifferentiableAugmenter
 from image_gen_aux import DepthPreprocessor, LineArtPreprocessor
 import random
 
+clip_preprocess = torchvision.transforms.Compose([
+    torchvision.transforms.Resize(224, interpolation=torchvision.transforms.InterpolationMode.BICUBIC),
+    torchvision.transforms.CenterCrop(224),
+    torchvision.transforms.Normalize(
+        mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)
+    )
+])
+
+
+def weighted_mse_loss(pred, target, weight):
+    """
+    pred, target: [B, 1, H, W]
+    weight: [B, 1, H, W], weight map (e.g., from sketch intensity or dilation)
+    """
+    return ((weight * (pred - target)**2).mean())
+
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -486,6 +503,206 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
     def attention_kwargs(self):
         return self._attention_kwargs
 
+    def decode_latents(self, latents):
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        frames = self.vae.decode(latents, return_dict=False)[0]
+        return frames
+
+    # ------------------------------------------------------------------ #
+    #  Helper: validate guidance args & normalize to per-step lists
+    # ------------------------------------------------------------------ #
+    def _validate_guidance_args(self, guidance_step, guidance_lr, num_inference_steps, loss_fn):
+        VALID_LOSS_FNS = {"frame", "style", "scribble", "gray", "depth"}
+        if loss_fn not in VALID_LOSS_FNS:
+            raise ValueError(f"loss_fn must be one of {sorted(VALID_LOSS_FNS)}")
+
+        if isinstance(guidance_step, int):
+            guidance_step = [guidance_step] * num_inference_steps
+        else:
+            assert len(guidance_step) == num_inference_steps, \
+                "guidance_step must be a list of length num_inference_steps"
+
+        if isinstance(guidance_lr, float):
+            guidance_lr = [guidance_lr] * num_inference_steps
+        else:
+            assert len(guidance_lr) == num_inference_steps, \
+                "guidance_lr must be a list of length num_inference_steps"
+
+        return guidance_step, guidance_lr
+
+    # ------------------------------------------------------------------ #
+    #  Helper: prepare per-loss-fn context (models, embeddings, etc.)
+    # ------------------------------------------------------------------ #
+    def _prepare_loss_context(self, loss_fn, video, additional_inputs, device, dtype, latent_downscale_factor=1):
+        """Return a dict of pre-computed objects needed by the chosen loss."""
+        ctx: Dict[str, Any] = {}
+
+        if loss_fn == "style":
+            assert additional_inputs is not None and "style_image" in additional_inputs, \
+                "additional_inputs with 'style_image' required for style loss"
+            if not hasattr(self, "csd"):
+                self.csd, self.preprocess = setup_csd(device=device)
+            ctx["cosine_loss"] = torch.nn.CosineSimilarity(dim=1)
+            ctx["style_image"] = additional_inputs["style_image"]
+            ctx["content_image"] = additional_inputs.get("content_image", None)
+            ctx["style_weight"] = additional_inputs.get("style_weight", 1.0)
+            ctx["content_weight"] = additional_inputs.get("content_weight", 0.0)
+
+        elif loss_fn in ("scribble", "gray"):
+            assert video is not None, "video must be provided for scribble/gray loss"
+            if not hasattr(self, "aug"):
+                self.aug = DifferentiableAugmenter().to(device).requires_grad_(False)
+            import torchvision.transforms as T
+            to_tensor = T.ToTensor()
+            cond_video = [to_tensor(f).to(device, dtype=dtype) for f in video]
+            with torch.no_grad():
+                cond_video = [self.aug(f, mode=loss_fn) for f in cond_video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f.unsqueeze(0), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).squeeze(0) for f in cond_video]
+                ctx["cond_video"] = cond_video
+
+        elif loss_fn == "depth":
+            assert video is not None, "video must be provided for depth loss"
+            if not hasattr(self, "depth_preprocessor"):
+                self.depth_preprocessor = DepthPreprocessor.from_pretrained(
+                    "depth-anything/Depth-Anything-V2-Small-hf"
+                ).to(device)
+            with torch.no_grad():
+                cond_video = [self.depth_preprocessor(f, return_type="pt") for f in video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f, scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False) for f in cond_video]
+                ctx["cond_video"] = cond_video
+
+        elif loss_fn == "frame":
+            if additional_inputs is not None and "mask_video" in additional_inputs:
+                mask_video = []
+                for frame in additional_inputs["mask_video"]:
+                    frame = torch.from_numpy(np.array(frame)).permute(2, 0, 1)  # 3, H, W
+                    frame = frame.unsqueeze(0).unsqueeze(2)                     # 1, 3, 1, H, W
+                    if latent_downscale_factor > 1:
+                        frame = F.interpolate(frame.squeeze(2), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).unsqueeze(2)
+                    mask_video.append(frame.to(device, dtype=dtype))
+                ctx["mask_video"] = mask_video
+
+        return ctx
+
+    # ------------------------------------------------------------------ #
+    #  Helper: single transformer forward pass (with or without grad)
+    # ------------------------------------------------------------------ #
+    def _predict_noise(
+        self, latent_model_input, encoder_hidden_states, image_embeds,
+        timestep, attention_kwargs, *, enable_grad=False,
+    ):
+        ctx_mgr = torch.enable_grad() if enable_grad else torch.no_grad()
+        with ctx_mgr:
+            noise_pred = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_image=image_embeds,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+        return noise_pred
+
+    # ------------------------------------------------------------------ #
+    #  Helper: compute guidance loss for one fixed frame
+    # ------------------------------------------------------------------ #
+    def _compute_single_frame_loss(
+        self, loss_fn, pred_original_sample, fixed_frame,
+        original_video, loss_ctx, additional_inputs, device, step_idx, rep_idx,
+        latent_downscale_factor=1,
+    ):
+        """Decode the predicted latent around *fixed_frame* and return a scalar loss."""
+        if fixed_frame == 0:
+            print("fixed_frame == 0, pass")
+            return None
+
+        latent_frame = (fixed_frame - 1) // 4 + 1
+        latent_pair = pred_original_sample[:, :, latent_frame - 1 : latent_frame + 1]  # [1, C, 2, H, W]
+        if latent_downscale_factor > 1:
+            latent_pair = F.interpolate(
+                latent_pair.squeeze(0), scale_factor=1/latent_downscale_factor,
+                mode='bilinear', align_corners=False
+            ).unsqueeze(0)
+        decoded_frames = self.decode_latents(latent_pair)  # [1, 3, 5, H, W]
+        del latent_pair
+
+        relative_frame_idx = (fixed_frame - 1) % 4 + 1
+        pred_frame = decoded_frames[:, :, relative_frame_idx : relative_frame_idx + 1]  # [1, 3, 1, H, W]
+
+        # ---- per-loss-fn computation ----
+        if loss_fn == "frame":
+            target = original_video[:, :, fixed_frame : fixed_frame + 1].to(device=device)
+            if "mask_video" in loss_ctx:
+                loss = (F.mse_loss(pred_frame.float(), target.float(), reduction="none")
+                        * loss_ctx["mask_video"][fixed_frame]).mean()
+            else:
+                loss = F.mse_loss(pred_frame.float(), target.float())
+
+        elif loss_fn == "style":
+            pred_frame_sq = pred_frame.squeeze(2)
+            _, content_emb, style_emb = self.csd(clip_preprocess(pred_frame_sq.float()))
+            with torch.no_grad():
+                if "style_embed" not in additional_inputs:
+                    _, _, style_emb_ref = self.csd(
+                        self.preprocess(loss_ctx["style_image"]).unsqueeze(0).to(device))
+                    additional_inputs["style_embed"] = style_emb_ref
+                    if loss_ctx["content_image"] is not None:
+                        _, content_emb_ref, _ = self.csd(
+                            self.preprocess(loss_ctx["content_image"]).unsqueeze(0).to(device))
+                        additional_inputs["content_embed"] = content_emb_ref
+                style_emb_ref = additional_inputs["style_embed"].to(device)
+            cos = loss_ctx["cosine_loss"]
+            style_sim = cos(style_emb, style_emb_ref)
+            print(f"style_similarity({step_idx}/{rep_idx}): {style_sim.item():.3f}")
+            loss = loss_ctx["style_weight"] * (1 - style_sim)
+            if "content_embed" in additional_inputs:
+                content_emb_ref = additional_inputs["content_embed"].to(device)
+                content_sim = cos(content_emb, content_emb_ref)
+                print(f"content_similarity({step_idx}/{rep_idx}): {content_sim.item():.3f}")
+                loss = loss + loss_ctx["content_weight"] * (1 - content_sim)
+
+        elif loss_fn in ("scribble", "gray"):
+            sketch_obs = self.aug(pred_frame.squeeze(2).float(), mode=loss_fn)
+            loss = F.mse_loss(sketch_obs, loss_ctx["cond_video"][fixed_frame].float())
+
+        elif loss_fn == "depth":
+            pred_depth = self.depth_preprocessor(pred_frame.squeeze(2), return_type="pt")
+            loss = F.mse_loss(pred_depth.float(), loss_ctx["cond_video"][fixed_frame].float())
+
+        del decoded_frames, pred_frame
+        return loss
+
+    # ------------------------------------------------------------------ #
+    #  Helper: apply gradient-based guidance update to latents
+    # ------------------------------------------------------------------ #
+    def _apply_guidance_update(
+        self, latents, pred_original_sample, grad,
+        guidance_lr_i, sigma, generator, device, in_travel_time,
+    ):
+        grad_norm = grad.norm(2)
+        rho = 1.0 / grad_norm
+
+        with torch.no_grad():
+            if in_travel_time:
+                noise = randn_tensor(pred_original_sample.shape, generator=generator, device=device, dtype=pred_original_sample.dtype)
+                latents = sigma * noise + (1 - sigma) * pred_original_sample
+                latents = latents - guidance_lr_i * rho * grad
+            else:
+                latents = latents - guidance_lr_i * rho * grad
+
+        return latents
+
     # @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -520,6 +737,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         loss_fn: str = "frame",
         additional_inputs: Optional[Dict[str, Any]] = None,
         travel_time: Tuple[int, int] = (0, 50),
+        latent_downscale_factor: int = 1,
+        offload: bool = True,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -598,58 +817,18 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 the first element is a list with the generated images and the second element is a list of `bool`s
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-        if isinstance(guidance_step, int):
-            guidance_step = [guidance_step] * num_inference_steps
-        else:
-            assert len(guidance_step) == num_inference_steps, "guidance_step must be a list of length num_inference_steps"
+        # --- Validate & normalize guidance arguments ---
+        guidance_step, guidance_lr = self._validate_guidance_args(
+            guidance_step, guidance_lr, num_inference_steps, loss_fn)
 
-        if isinstance(guidance_lr, float):
-            guidance_lr = [guidance_lr] * num_inference_steps
-        else:
-            assert len(guidance_lr) == num_inference_steps, "guidance_lr must be a list of length num_inference_steps"
-        
-        if loss_fn not in ["frame", "style", "scribble", "gray", "depth"]:
-            raise ValueError("loss_fn must be one of ['frame', 'style', 'scribble', 'gray', 'depth']")
-        
-        if loss_fn == "style":  
-            assert additional_inputs is not None, "additional_inputs must be provided when loss_fn is 'style'"
-            if "style_image" not in additional_inputs:
-                raise ValueError("style_image must be provided in additional_inputs when loss_fn is 'style'")
-            style_image = additional_inputs["style_image"]
-            content_image = additional_inputs.get("content_image", None)
-            
-            cosine_loss = torch.nn.CosineSimilarity(dim=1)
-            # if csd is not already initialized, initialize it
-            if not hasattr(self, "csd"):
-                self.csd, self.preprocess = setup_csd(device=self._execution_device)
-            
-            style_weight = additional_inputs.get("style_weight", 1.0)
-            content_weight = additional_inputs.get("content_weight", 0.0)
+        if latent_downscale_factor not in (1, 2, 4):
+            raise ValueError("latent_downscale_factor must be one of [1, 2, 4]")
 
-        elif loss_fn == "scribble" or loss_fn == "gray":
-            assert video is not None, "video must be provided when loss_fn is 'scribble'"
-            if not hasattr(self, "sketch_model"):
-                self.aug = DifferentiableAugmenter().to(self._execution_device).requires_grad_(False)
-            import torchvision.transforms as T
-            to_tensor = T.ToTensor()
-            cond_video = [to_tensor(frame).to(self._execution_device, dtype=self.transformer.dtype) for frame in video]
-            with torch.no_grad():
-                cond_video = [self.aug(frame, mode=loss_fn) for frame in cond_video]      
-
-        # elif loss_fn == "face":
-        #     assert additional_inputs is not None, "additional_inputs must be provided when loss_fn is 'face'"
-        #     if "ref_image" not in additional_inputs:
-        #         raise ValueError("ref_image must be provided in additional_inputs when loss_fn is 'face'")
-        #     ref_image = additional_inputs["ref_image"]
-        #     idloss = IDLoss(ref_image).to(self._execution_device)
-        
-        elif loss_fn == "depth":
-            assert video is not None, "video must be provided when loss_fn is 'depth'"
-            if not hasattr(self, "depth_preprocessor"):
-                self.depth_preprocessor = DepthPreprocessor.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf").to(self._execution_device)
-            with torch.no_grad():
-                cond_video = [self.depth_preprocessor(frame, return_type="pt") for frame in video]
-                cond_video = [F.interpolate(cond_video[i], scale_factor=1/2, mode='bilinear', align_corners=False) for i in range(len(cond_video))]
+        # --- Prepare loss-specific context (models, conditioning videos, etc.) ---
+        loss_ctx = self._prepare_loss_context(
+            loss_fn, video, additional_inputs,
+            device=self._execution_device, dtype=self.transformer.dtype,
+            latent_downscale_factor=latent_downscale_factor)
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
@@ -691,6 +870,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             batch_size = prompt_embeds.shape[0]
 
         # 3. Encode input prompt
+        if offload:
+            self.text_encoder.to(device)
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -701,6 +882,9 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             max_sequence_length=max_sequence_length,
             device=device,
         )
+        if offload:
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
 
         # Encode image embedding
         transformer_dtype = self.transformer.dtype
@@ -709,10 +893,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
         if image_embeds is None:
+            if offload:
+                self.image_encoder.to(device)
             if last_image is None:
                 image_embeds = self.encode_image(image, device)
             else:
                 image_embeds = self.encode_image([image, last_image], device)
+            if offload:
+                self.image_encoder.to("cpu")
+                torch.cuda.empty_cache()
         image_embeds = image_embeds.repeat(batch_size, 1, 1)
         image_embeds = image_embeds.to(transformer_dtype)
 
@@ -742,22 +931,18 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             last_image,
         )
 
-        original_video = [None] * num_frames
-        if fixed_frames is not None:
-            for idx in fixed_frames:
-                original_video[idx] = self.video_processor.preprocess(video[idx], height=height // 2, width=width // 2).to(self.device, dtype=self.vae.dtype)
-        else:
-            original_video = [self.video_processor.preprocess(frame, height=height // 2, width=width // 2).to(self.device, dtype=self.vae.dtype) for frame in video]
-        
+        target_h = height // latent_downscale_factor if latent_downscale_factor > 1 else height
+        target_w = width // latent_downscale_factor if latent_downscale_factor > 1 else width
+        original_video = self.video_processor.preprocess_video(video, height=target_h, width=target_w)
+        original_video = original_video.to(device=device, dtype=self.vae.dtype)  # [1, 3, num_frames, H, W]
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        scheduler = self.scheduler
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            max_grad_norm = 1.0
             for i, t in enumerate(timesteps):
-                
                 if self.interrupt:
                     continue
 
@@ -767,192 +952,64 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 self._current_timestep = t
                 timestep = t.expand(latents.shape[0])
 
-                for rep in range(n_repeats+1):
+                # Scheduler coefficients for this step
+                if scheduler.step_index is None:
+                    scheduler._init_step_index(timestep)
+                sigma = scheduler.sigmas[scheduler.step_index]
+                sigma_next = scheduler.sigmas[scheduler.step_index + 1]
 
+                for rep in range(n_repeats + 1):
                     latents = latents.detach().clone().requires_grad_(in_guidance_range)
                     latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
 
-                    if in_guidance_range and rep < n_repeats:
-                        with torch.enable_grad():
-                            noise_pred = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
+                    need_grad = in_guidance_range and rep < n_repeats
 
-                            noise_uncond = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=negative_prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
-                    else:
-                        with torch.no_grad():
-                            noise_pred = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
-                            noise_uncond = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=negative_prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                                attention_kwargs=attention_kwargs,
-                                return_dict=False,
-                            )[0]
-
+                    # Predict noise (positive and negative passes)
+                    noise_pred = self._predict_noise(
+                        latent_model_input, prompt_embeds, image_embeds,
+                        timestep, attention_kwargs, enable_grad=need_grad,
+                    )
+                    noise_uncond = self._predict_noise(
+                        latent_model_input, negative_prompt_embeds, image_embeds,
+                        timestep, attention_kwargs, enable_grad=need_grad,
+                    )
                     noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
-                    with torch.no_grad():
-                        correction = noise_pred - noise_uncond
-                        correction = correction.detach()
+                    # Predicted x0 (flow matching)
+                    pred_original_sample = latents - sigma * noise_pred
 
-                    scheduler = self.scheduler
-                    if scheduler.step_index is None:
-                        scheduler._init_step_index(timestep)
-
-                    # Upcast to avoid precision issues when computing prev_sample
-                    sigma = scheduler.sigmas[scheduler.step_index]
-                    sigma_next = scheduler.sigmas[scheduler.step_index + 1]
-
-                    pred_original_sample = latents - sigma * noise_pred # 1, C, T, H, W
-
-                    if in_guidance_range and rep < n_repeats:
+                    # ---- Guidance gradient step (skip on last rep) ----
+                    if need_grad:
+                        fixed_frames_ = fixed_frames if fixed_frames is not None \
+                            else random.sample(range(5, num_frames), 4)
                         total_loss = 0.0
-                        if fixed_frames is None:
-                            fixed_frames_ = random.sample(range(5, 81), 4)
-                        else:
-                            fixed_frames_ = fixed_frames
+                        for ff in fixed_frames_:
+                            loss = self._compute_single_frame_loss(
+                                loss_fn, pred_original_sample, ff,
+                                original_video, loss_ctx, additional_inputs,
+                                device, step_idx=i, rep_idx=rep,
+                                latent_downscale_factor=latent_downscale_factor,
+                            )
+                            if loss is not None:
+                                total_loss = total_loss + loss
 
-                        for fixed_frame in fixed_frames_:
-                            # Calculate corresponding latent frame index
-                            # Special handling for the first frame
-                            if fixed_frame == 0:
-                                print("fixed_frame == 0, pass")
-                                continue
-                            else:
-                                # For frames after 0, we need to consider:
-                                # - First latent frame (index 0) corresponds to real frame 0
-                                # - Second latent frame (index 1) corresponds to real frames 1,2,3,4
-                                # - Third latent frame (index 2) corresponds to real frames 5,6,7,8
-                                # So: latent_frame = (fixed_frame - 1) // 4 + 1
-                                latent_frame = (fixed_frame - 1) // 4 + 1
-                                    
-                            latent_pair = pred_original_sample[:, :, latent_frame-1:latent_frame+1]  # Shape: [1, C, 2, H, W]
-                            latent_pair = F.interpolate(latent_pair.squeeze(0), scale_factor=1/2, mode='bilinear', align_corners=False).unsqueeze(0)
-                            decoded_frames = self.decode_latents(latent_pair)  # Shape: [1, 3, 5, H, W]
-                            del latent_pair
-                            # Calculate the relative frame index   
-                            relative_frame_idx = (fixed_frame - 1) % 4 + 1
-                            pred_frame = decoded_frames[:, :, relative_frame_idx:relative_frame_idx+1] # 1, 3, 1, H, W
-
-
-                            # Add to total loss
-                            if loss_fn == "frame":
-                                loss = F.mse_loss(
-                                    pred_frame,
-                                    original_video[fixed_frame].unsqueeze(2).to(device=device),
-                                    reduction="mean"
-                                )
-                            elif loss_fn == "style":
-                                pred_frame = pred_frame.squeeze(2)
-                                _, content_embedding, style_embedding = self.csd(clip_preprocess(pred_frame.float()))
-                                with torch.no_grad():
-                                    # style image is PIL image
-                                    if "style_embed" not in additional_inputs:
-                                        _, _, style_embedding_ref = self.csd(self.preprocess(style_image).unsqueeze(0).to(device))
-                                        additional_inputs["style_embed"] = style_embedding_ref
-                                        if "content_image" in additional_inputs:
-                                            _, content_embedding_ref, _ = self.csd(self.preprocess(content_image).unsqueeze(0).to(device))
-                                            additional_inputs["content_embed"] = content_embedding_ref
-                                            content_embedding_ref = content_embedding_ref.to(device)
-                                    else:
-                                        style_embedding_ref = additional_inputs["style_embed"]
-                                        if "content_embed" in additional_inputs:
-                                            content_embedding_ref = additional_inputs["content_embed"]
-                                            content_embedding_ref = content_embedding_ref.to(device)
-               
-                                    style_embedding_ref = style_embedding_ref.to(device)
-                                style_similarity = cosine_loss(style_embedding, style_embedding_ref)
-                                print(f"style_similarity({i}/{rep}): {style_similarity.item():.3f}")
-                                loss = style_weight * (1 - style_similarity)
-                                
-                                if "content_embed" in additional_inputs:
-                                    content_similarity = cosine_loss(content_embedding, content_embedding_ref)
-                                    print(f"content_similarity({i}/{rep}): {content_similarity.item():.3f}")
-                                    loss += content_weight * (1 - content_similarity)
-                            
-                            elif loss_fn == "scribble" or loss_fn == "gray":
-                                sketch_observation = self.aug(pred_frame.squeeze(2).float(), mode=loss_fn)
-                                target = cond_video[fixed_frame].float()
-                                loss = F.mse_loss(
-                                    sketch_observation,
-                                    target,
-                                    reduction="mean"
-                                )
-                            
-                            # elif loss_fn == "face":
-                            #     print("pred_frame", pred_frame.shape)
-                            #     face_similarity = idloss.get_cosine_similarity(pred_frame.squeeze())
-                            #     loss = 1 - face_similarity
-
-                            elif loss_fn == "depth":
-                                pred_depth = self.depth_preprocessor(pred_frame.squeeze(2), return_type="pt")
-                                loss = F.mse_loss(
-                                    pred_depth.float(),
-                                    cond_video[fixed_frame].float(),
-                                    reduction="mean"
-                                )
-
-                            total_loss += loss
-                            
-                            # Clear intermediate tensors
-                            del decoded_frames, pred_frame
-                            torch.cuda.empty_cache()
-
-                        # grad = torch.autograd.grad(total_loss, [latents], retain_graph=False, create_graph=False)[0]
-                        # Instead of torch.autograd.grad(), use backward()
                         total_loss.backward()
+                        print(f"total_loss({i}/{rep}): {total_loss.item():.3f}")
                         grad = latents.grad.clone()
-                        latents.grad = None  # Clear the gradients
+                        latents.grad = None
 
-                       # Apply gradient clipping
-                        grad_norm = grad.norm(2)
-                        rho = 1 / grad_norm
-
-                        # (7) Apply guidance gradient step only (latents -= lr * grad)
-                        #     No denoising step yet
-                        if i >= travel_time[0] and i <= travel_time[1]:
-                            with torch.no_grad():
-                                # pred_original_sample # clean data
-                                noise = randn_tensor(pred_original_sample.shape, generator=generator, device=device, dtype=pred_original_sample.dtype)
-                                latents = sigma * noise + (1 - sigma) * pred_original_sample
-                                latents = latents - guidance_lr[i] * rho * grad # update with guidance
-                            
-                        else:
-                            with torch.no_grad():
-                                latents = latents - guidance_lr[i] * rho * grad # update with guidance
-
+                        in_travel = i >= travel_time[0] and i <= travel_time[1]
+                        latents = self._apply_guidance_update(
+                            latents, pred_original_sample, grad,
+                            guidance_lr[i], sigma, generator, device, in_travel,
+                        )
                         torch.cuda.empty_cache()
-                    else:
-                        # If outside guidance range, skip repeated updates
-                        # and proceed directly to the final denoising step
-                        pass
+
+                # ---- Final denoising step ----
                 with torch.no_grad():
                     latents = latents + (sigma_next - sigma) * noise_pred
-                    
-                latents = latents.to(noise_pred.dtype)
 
-                # upon completion increase step index by one
+                latents = latents.to(noise_pred.dtype)
                 scheduler._step_index += 1
 
                 if callback_on_step_end is not None:
@@ -960,12 +1017,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
-                # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 

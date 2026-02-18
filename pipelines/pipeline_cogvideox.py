@@ -606,7 +606,8 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
     #  Helper: prepare per-loss-fn context (models, embeddings, etc.)
     # ------------------------------------------------------------------ #
     def _prepare_loss_context(self, loss_fn, video, additional_inputs, device, dtype,
-                              num_frames=None, width=None, height=None):
+                              num_frames=None, width=None, height=None,
+                              latent_downscale_factor=1):
         """Return a dict of pre-computed objects needed by the chosen loss."""
         ctx: Dict[str, Any] = {}
 
@@ -636,7 +637,10 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             to_tensor = T.ToTensor()
             cond_video = [to_tensor(f).to(device, dtype=dtype) for f in video]
             with torch.no_grad():
-                ctx["cond_video"] = [self.aug(f, mode=loss_fn) for f in cond_video]
+                cond_video = [self.aug(f, mode=loss_fn) for f in cond_video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f.unsqueeze(0), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).squeeze(0) for f in cond_video]
+                ctx["cond_video"] = cond_video
 
         elif loss_fn == "depth":
             assert video is not None, "video must be provided for depth loss"
@@ -645,7 +649,10 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     "depth-anything/Depth-Anything-V2-Small-hf"
                 ).to(device)
             with torch.no_grad():
-                ctx["cond_video"] = [self.depth_preprocessor(f, return_type="pt") for f in video]
+                cond_video = [self.depth_preprocessor(f, return_type="pt") for f in video]
+                if latent_downscale_factor > 1:
+                    cond_video = [F.interpolate(f, scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False) for f in cond_video]
+                ctx["cond_video"] = cond_video
 
         elif loss_fn == "loop":
             ctx["fixed_frames"] = [0, num_frames - 1]
@@ -703,6 +710,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
     def _compute_single_frame_loss(
         self, loss_fn, pred_original_sample, fixed_frame,
         original_video, loss_ctx, additional_inputs, device, step_idx, rep_idx,
+        latent_downscale_factor=1,
     ):
         """Decode the predicted latent around *fixed_frame* and return a scalar loss."""
         if fixed_frame < 5:
@@ -711,6 +719,11 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         latent_frame = (fixed_frame - 1) // 4 + 1
         latent_pair = pred_original_sample[:, latent_frame - 2 : latent_frame + 1]
+        if latent_downscale_factor > 1:
+            b, f, c, h, w = latent_pair.shape
+            latent_pair = latent_pair.reshape(b * f, c, h, w)
+            latent_pair = F.interpolate(latent_pair, scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False)
+            latent_pair = latent_pair.reshape(b, f, c, latent_pair.shape[-2], latent_pair.shape[-1])
         decoded_frames = self.decode_latents(latent_pair)
         del latent_pair
 
@@ -719,10 +732,11 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         # ---- per-loss-fn computation ----
         if loss_fn == "frame":
-            loss = F.mse_loss(
-                pred_frame.float(),
-                original_video[:, :, fixed_frame : fixed_frame + 1].float(),
-            )
+            target = original_video[:, :, fixed_frame : fixed_frame + 1].float()
+            if latent_downscale_factor > 1:
+                b, c, f, h, w = target.shape
+                target = F.interpolate(target.squeeze(2), scale_factor=1/latent_downscale_factor, mode='bilinear', align_corners=False).unsqueeze(2)
+            loss = F.mse_loss(pred_frame.float(), target)
 
         elif loss_fn == "style":
             pred_frame_sq = pred_frame.squeeze(2)
@@ -807,13 +821,14 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 226,
+        strength: float = 1.0,
         fixed_frames: Optional[Union[int, List[int]]] = None,
         guidance_step: Union[list[int], int] = 0,
         guidance_lr: Union[float, list[float]] = 1e-2,
         loss_fn: str = "frame",
         additional_inputs: Optional[Dict[str, Any]] = None,
         travel_time: Tuple[int, int] = (0, 50),
-        strength: float = 1.0,
+        latent_downscale_factor: int = 1,
     ) -> Union[CogVideoXPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -898,6 +913,9 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         guidance_step, guidance_lr = self._validate_guidance_args(
             guidance_step, guidance_lr, num_inference_steps, loss_fn)
 
+        if latent_downscale_factor not in (1, 2, 4):
+            raise ValueError("latent_downscale_factor must be one of [1, 2, 4]")
+
         height = height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
         width = width or self.transformer.config.sample_width * self.vae_scale_factor_spatial
         num_frames = num_frames or self.transformer.config.sample_frames
@@ -906,7 +924,8 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         loss_ctx = self._prepare_loss_context(
             loss_fn, video, additional_inputs,
             device=self._execution_device, dtype=self.transformer.dtype,
-            num_frames=num_frames, width=width, height=height)
+            num_frames=num_frames, width=width, height=height,
+            latent_downscale_factor=latent_downscale_factor)
 
         # Apply loop-specific overrides
         if loss_fn == "loop":
@@ -1081,6 +1100,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                                     loss_fn, pred_original_sample, ff,
                                     original_video, loss_ctx, additional_inputs,
                                     device, step_idx=i, rep_idx=rep,
+                                    latent_downscale_factor=latent_downscale_factor,
                                 )
                                 if loss is not None:
                                     total_loss = total_loss + loss
