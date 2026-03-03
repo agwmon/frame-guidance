@@ -41,10 +41,12 @@ Please refer to `setting.sh` for conda environment setup.
 See details in each task-specific examples.
 
 ```
-@article{jang2025frame,
-  title={Frame Guidance: Training-Free Guidance for Frame-Level Control in Video Diffusion Models},
-  author={Jang, Sangwon and Ki, Taekyung and Jo, Jaehyeong and Yoon, Jaehong and Kim, Soo Ye and Lin, Zhe and Hwang, Sung Ju},
-  journal={arXiv preprint arXiv:2506.07177},
-  year={2025}
+@inproceedings{
+  jang2026frame,
+  title={Frame Guidance: Training-Free Guidance for Frame-Level Control in Video Diffusion Model},
+  author={Sangwon Jang and Taekyung Ki and Jaehyeong Jo and Jaehong Yoon and Soo Ye Kim and Zhe Lin and Sung Ju Hwang},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://openreview.net/forum?id=y39XbEp1vK}
 }
 ```
